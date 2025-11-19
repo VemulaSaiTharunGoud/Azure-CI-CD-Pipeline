@@ -1,0 +1,96 @@
+trigger:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  DEPLOY_FOLDER: '/opt/myapp'
+  BACKUP_FOLDER: '/opt/myapp_prev'
+  SSH_ENDPOINT: 'SSH-DEPLOY' # <-- name of service connection you will create
+
+steps:
+- checkout: self
+- task: NodeTool@0
+  inputs:
+    versionSpec: '18.x'
+  displayName: 'Install Node.js'
+
+- script: |
+    npm ci
+  displayName: 'Install dependencies'
+
+- script: |
+    npm run build
+  displayName: 'Build step'
+
+- script: |
+    echo "----- run-tests (expected to FAIL initially) -----"
+    npm run test
+  displayName: 'run-tests'
+  continueOnError: false
+
+# Copy repo to artifact staging before publishing
+- script: |
+    mkdir -p $(Build.ArtifactStagingDirectory)
+    cp -R * $(Build.ArtifactStagingDirectory) || true
+  displayName: 'Prepare artifact staging'
+
+- task: PublishPipelineArtifact@1
+  inputs:
+    targetPath: '$(Build.ArtifactStagingDirectory)'
+    artifact: 'drop'
+  displayName: 'Publish artifact (drop)'
+
+# Backup the current app on the target host (if exists)
+- task: SSH@0
+  displayName: 'Create backup on target'
+  inputs:
+    sshEndpoint: '$(SSH_ENDPOINT)'
+    runOptions: 'inline'
+    inline: |
+      set -e
+      echo "Backup step - target DEPLOY_FOLDER=$(DEPLOY_FOLDER) BACKUP_FOLDER=$(BACKUP_FOLDER)"
+      if [ -d "$(DEPLOY_FOLDER)" ]; then
+        rm -rf "$(BACKUP_FOLDER)" || true
+        mv "$(DEPLOY_FOLDER)" "$(BACKUP_FOLDER)"
+      fi
+      mkdir -p "$(DEPLOY_FOLDER)"
+      echo "Backup created (if previous existed)."
+
+# Copy files to target
+- task: CopyFilesOverSSH@0
+  displayName: 'Copy files to target'
+  inputs:
+    sshEndpoint: '$(SSH_ENDPOINT)'
+    sourceFolder: '$(Build.ArtifactStagingDirectory)'
+    contents: '**'
+    targetFolder: '$(DEPLOY_FOLDER)'
+
+# Start on target and implement rollback if start fails
+- task: SSH@0
+  displayName: 'Start app on target (rollback on failure)'
+  inputs:
+    sshEndpoint: '$(SSH_ENDPOINT)'
+    runOptions: 'inline'
+    inline: |
+      set -e
+      echo "Attempting to start app at $(DEPLOY_FOLDER)"
+      chmod +x $(DEPLOY_FOLDER)/start.sh || true
+      if /bin/bash -c "$(DEPLOY_FOLDER)/start.sh"; then
+        echo "Start succeeded"
+        exit 0
+      else
+        echo "Start failed"
+        echo "Rollback triggered"
+        rm -rf "$(DEPLOY_FOLDER)"
+        if [ -d "$(BACKUP_FOLDER)" ]; then
+          mv "$(BACKUP_FOLDER)" "$(DEPLOY_FOLDER)"
+          echo "Restored previous version"
+          chmod +x $(DEPLOY_FOLDER)/start.sh || true
+          /bin/bash -c "$(DEPLOY_FOLDER)/start.sh" || true
+        fi
+        exit 1
+      fi
